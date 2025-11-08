@@ -20,7 +20,7 @@ def clear_clearing_date(voucher_type: str, voucher_name: str):
 
 @frappe.whitelist()
 def reconcile_vouchers(bank_transaction_name, vouchers, is_new_voucher: bool = False):
-	 
+     
     # updated clear date of all the vouchers based on the bank transaction
     vouchers = json.loads(vouchers)
     transaction = frappe.get_doc("Bank Transaction", bank_transaction_name)
@@ -155,14 +155,14 @@ def create_internal_transfer(bank_transaction_name: str,
     pe.submit()
 
     vouchers = json.dumps(
-		[
-			{
-				"payment_doctype": "Payment Entry",
-				"payment_name": pe.name,
-				"amount": bank_transaction.unallocated_amount,
-			}
-		]
-	)
+        [
+            {
+                "payment_doctype": "Payment Entry",
+                "payment_name": pe.name,
+                "amount": bank_transaction.unallocated_amount,
+            }
+        ]
+    )
 
     transaction_id = reconcile_vouchers(bank_transaction_name, vouchers, is_new_voucher=True)
 
@@ -235,6 +235,26 @@ def create_bank_entry_and_reconcile(bank_transaction_name: str,
     # Compute accounts for JE 
     is_withdrawal = bank_transaction.withdrawal > 0.0
 
+    # --- BEGIN PATCH: bank_cost_center fallback ---
+    # Prefer explicit bank_cost_center from request (frappe.form_dict) else use cost_center from first entry
+    bank_cost_center = None
+    try:
+        if hasattr(frappe, "form_dict") and frappe.form_dict.get("bank_cost_center"):
+            bank_cost_center = frappe.form_dict.get("bank_cost_center")
+    except Exception:
+        bank_cost_center = None
+
+    try:
+        if not bank_cost_center and "entries" in locals() and entries:
+            first_entry = entries[0]
+            if isinstance(first_entry, dict):
+                bank_cost_center = first_entry.get("cost_center") or bank_cost_center
+            elif hasattr(first_entry, "cost_center"):
+                bank_cost_center = getattr(first_entry, "cost_center", bank_cost_center)
+    except Exception:
+        pass
+    # --- END PATCH ---
+
     if is_withdrawal:
         bank_entry.append("accounts", {
             "account": bank_account,
@@ -243,6 +263,7 @@ def create_bank_entry_and_reconcile(bank_transaction_name: str,
             "credit": bank_transaction.unallocated_amount,
             "debit_in_account_currency": 0,
             "debit": 0,
+            "cost_center": bank_cost_center,
         })
     else:
         bank_entry.append("accounts", {
@@ -251,23 +272,46 @@ def create_bank_entry_and_reconcile(bank_transaction_name: str,
             "debit_in_account_currency": bank_transaction.unallocated_amount,
             "debit": bank_transaction.unallocated_amount,
             "credit_in_account_currency": 0,
-            "debit": 0,
+            "credit": 0,
+            "cost_center": bank_cost_center,
         })
     
     if not dimensions:
         dimensions = {}
     
     for entry in entries:
-        # Check if this account is a Income or Expense Account
-        # If it is, and no cost center is added, select the company default cost center
+        # compute dimensions-level cost_center if provided
         cost_center = dimensions.get("cost_center")
 
+        # If not provided, use account report_type and default
         if not cost_center:
             report_type = frappe.get_cached_value("Account", entry["account"], "report_type")
             if report_type == "Profit and Loss":
                 # Cost center is required
                 cost_center = default_cost_center
-        
+
+        # compute final_cost_center for this entry (prefer entry -> bank_cost_center -> company default)
+        entry_cost_center = None
+        if isinstance(entry, dict):
+            entry_cost_center = entry.get("cost_center")
+        elif hasattr(entry, "get"):
+            try:
+                entry_cost_center = entry.get("cost_center")
+            except Exception:
+                entry_cost_center = getattr(entry, "cost_center", None)
+        else:
+            entry_cost_center = getattr(entry, "cost_center", None)
+
+        final_cost_center = entry_cost_center or cost_center or bank_cost_center
+
+        if not final_cost_center:
+            try:
+                company_name = locals().get("company") or getattr(bank_entry, "company", None)
+                if company_name:
+                    final_cost_center = frappe.get_cached_value("Company", company_name, "default_cost_center")
+            except Exception:
+                final_cost_center = None
+
         credit = entry["amount"] if not is_withdrawal else 0
         debit = entry["amount"] if is_withdrawal else 0
         bank_entry.append("accounts", {
@@ -277,7 +321,7 @@ def create_bank_entry_and_reconcile(bank_transaction_name: str,
             "credit_in_account_currency": credit,
             "debit": debit,
             "credit": credit,
-            "cost_center": cost_center,
+            "cost_center": final_cost_center,
             "party_type": entry.get("party_type") if entry.get("party") else None,
             "party": entry.get("party"),
             "user_remark": entry.get("user_remark"),
@@ -440,4 +484,3 @@ def search_for_transfer_transaction(transaction_id: str):
         }
 
     return None
-
